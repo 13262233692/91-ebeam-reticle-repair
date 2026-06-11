@@ -1,7 +1,17 @@
 #pragma once
-#include <napi.h>
 #include "common.h"
 #include <opencv2/opencv.hpp>
+#include <vector>
+#include <string>
+
+struct DetectionOptionsPure {
+    double gaussianSigma = 1.5;
+    int blockSize = 31;
+    double C = 10.0;
+    double cannyLow = 40.0;
+    double cannyHigh = 120.0;
+    int cannyAperture = 3;
+};
 
 class ImageProcessor {
 public:
@@ -9,16 +19,16 @@ public:
     ~ImageProcessor();
 
     DetectionResult detectDefects(
-        const Napi::Uint8Array& pixelData,
+        const std::vector<uint8_t>& pixelBuf,
         int width,
         int height,
         int channels,
-        const Napi::Object& options
+        const DetectionOptionsPure& options
     );
 
     DetectionResult detectDefectsFromFile(
         const std::string& filePath,
-        const Napi::Object& options
+        const DetectionOptionsPure& options
     );
 
     std::vector<PointD> subpixelRefineContour(
@@ -33,7 +43,7 @@ public:
 
 private:
     cv::Mat loadImage(const std::string& path);
-    cv::Mat pixelsToMat(const Napi::Uint8Array& pixels, int w, int h, int ch);
+    cv::Mat pixelsToMat(const std::vector<uint8_t>& pixels, int w, int h, int ch);
     void extractDefectContours(
         const cv::Mat& binary,
         const cv::Mat& edges,

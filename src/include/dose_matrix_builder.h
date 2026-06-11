@@ -1,5 +1,4 @@
 #pragma once
-#include <napi.h>
 #include "common.h"
 #include <map>
 #include <string>
@@ -26,7 +25,7 @@ public:
         const ScanPathResult& scanPath,
         const std::map<std::string, MaterialCalibration>& materialMap,
         int layerIndex,
-        DefectContour::Type defectType
+        DefectType::Type defectType
     );
 
     DoseMatrixResult buildDoseMatrixSimple(
@@ -44,7 +43,7 @@ private:
         double baseDwell,
         double doseFactor,
         const MaterialCalibration& cal,
-        DefectContour::Type type
+        DefectType::Type type
     );
 
     double calculateVoltage(double coord, double maxCoord, double beamVoltage);

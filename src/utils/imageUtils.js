@@ -121,3 +121,15 @@ export function formatNumber(n, decimals = 2) {
   if (typeof n !== 'number' || isNaN(n)) return '0.00';
   return n.toFixed(decimals);
 }
+
+export function formatArea(areaPx, pixelSizeNm = 1.0) {
+  if (typeof areaPx !== 'number' || isNaN(areaPx)) return '0 px²';
+  if (areaPx < 1e6) {
+    return `${formatNumber(areaPx, 1)} px²`;
+  }
+  const areaNm2 = areaPx * pixelSizeNm * pixelSizeNm;
+  if (areaNm2 < 1e6) {
+    return `${formatNumber(areaNm2, 1)} nm²`;
+  }
+  return `${formatNumber(areaNm2 / 1e6, 2)} μm²`;
+}

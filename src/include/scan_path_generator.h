@@ -1,5 +1,4 @@
 #pragma once
-#include <napi.h>
 #include "common.h"
 #include <vector>
 

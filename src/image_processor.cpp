@@ -10,9 +10,9 @@ cv::Mat ImageProcessor::loadImage(const std::string& path) {
     return cv::imread(path, cv::IMREAD_UNCHANGED);
 }
 
-cv::Mat ImageProcessor::pixelsToMat(const Napi::Uint8Array& pixels, int w, int h, int ch) {
+cv::Mat ImageProcessor::pixelsToMat(const std::vector<uint8_t>& pixels, int w, int h, int ch) {
     cv::Mat mat(h, w, ch == 1 ? CV_8UC1 : CV_8UC4);
-    const uint8_t* src = pixels.Data();
+    const uint8_t* src = pixels.data();
     
     if (ch == 1) {
         std::memcpy(mat.data, src, w * h * sizeof(uint8_t));
@@ -193,11 +193,11 @@ void ImageProcessor::extractDefectContours(
 }
 
 DetectionResult ImageProcessor::detectDefects(
-    const Napi::Uint8Array& pixelData,
+    const std::vector<uint8_t>& pixelBuf,
     int width,
     int height,
     int channels,
-    const Napi::Object& options
+    const DetectionOptionsPure& options
 ) {
     DetectionResult result;
     result.success = false;
@@ -207,21 +207,7 @@ DetectionResult ImageProcessor::detectDefects(
     auto t0 = std::chrono::high_resolution_clock::now();
     
     try {
-        double gaussianSigma = 1.5;
-        int blockSize = 31;
-        double C = 10.0;
-        double cannyLow = 40.0;
-        double cannyHigh = 120.0;
-        int cannyAperture = 3;
-        
-        if (options.Has("gaussianSigma")) gaussianSigma = options.Get("gaussianSigma").As<Napi::Number>().DoubleValue();
-        if (options.Has("blockSize")) blockSize = options.Get("blockSize").As<Napi::Number>().Int32Value();
-        if (options.Has("C")) C = options.Get("C").As<Napi::Number>().DoubleValue();
-        if (options.Has("cannyLow")) cannyLow = options.Get("cannyLow").As<Napi::Number>().DoubleValue();
-        if (options.Has("cannyHigh")) cannyHigh = options.Get("cannyHigh").As<Napi::Number>().DoubleValue();
-        if (options.Has("cannyAperture")) cannyAperture = options.Get("cannyAperture").As<Napi::Number>().Int32Value();
-        
-        cv::Mat image = pixelsToMat(pixelData, width, height, channels);
+        cv::Mat image = pixelsToMat(pixelBuf, width, height, channels);
         cv::Mat gray;
         
         if (channels == 4) {
@@ -232,9 +218,9 @@ DetectionResult ImageProcessor::detectDefects(
             gray = image;
         }
         
-        cv::Mat blurred = gaussianBlur(gray, gaussianSigma);
-        cv::Mat adaptive = adaptiveThreshold(blurred, blockSize, C);
-        cv::Mat edges = cannyEdges(blurred, cannyLow, cannyHigh, cannyAperture);
+        cv::Mat blurred = gaussianBlur(gray, options.gaussianSigma);
+        cv::Mat adaptive = adaptiveThreshold(blurred, options.blockSize, options.C);
+        cv::Mat edges = cannyEdges(blurred, options.cannyLow, options.cannyHigh, options.cannyAperture);
         
         extractDefectContours(adaptive, edges, blurred, result.opaqueDefects, result.clearDefects);
         
@@ -258,7 +244,7 @@ DetectionResult ImageProcessor::detectDefects(
 
 DetectionResult ImageProcessor::detectDefectsFromFile(
     const std::string& filePath,
-    const Napi::Object& options
+    const DetectionOptionsPure& options
 ) {
     DetectionResult result;
     result.success = false;
@@ -277,20 +263,6 @@ DetectionResult ImageProcessor::detectDefectsFromFile(
         result.width = image.cols;
         result.height = image.rows;
         
-        double gaussianSigma = 1.5;
-        int blockSize = 31;
-        double C = 10.0;
-        double cannyLow = 40.0;
-        double cannyHigh = 120.0;
-        int cannyAperture = 3;
-        
-        if (options.Has("gaussianSigma")) gaussianSigma = options.Get("gaussianSigma").As<Napi::Number>().DoubleValue();
-        if (options.Has("blockSize")) blockSize = options.Get("blockSize").As<Napi::Number>().Int32Value();
-        if (options.Has("C")) C = options.Get("C").As<Napi::Number>().DoubleValue();
-        if (options.Has("cannyLow")) cannyLow = options.Get("cannyLow").As<Napi::Number>().DoubleValue();
-        if (options.Has("cannyHigh")) cannyHigh = options.Get("cannyHigh").As<Napi::Number>().DoubleValue();
-        if (options.Has("cannyAperture")) cannyAperture = options.Get("cannyAperture").As<Napi::Number>().Int32Value();
-        
         cv::Mat gray;
         if (image.channels() == 4) {
             cv::cvtColor(image, gray, cv::COLOR_BGRA2GRAY);
@@ -300,9 +272,9 @@ DetectionResult ImageProcessor::detectDefectsFromFile(
             gray = image;
         }
         
-        cv::Mat blurred = gaussianBlur(gray, gaussianSigma);
-        cv::Mat adaptive = adaptiveThreshold(blurred, blockSize, C);
-        cv::Mat edges = cannyEdges(blurred, cannyLow, cannyHigh, cannyAperture);
+        cv::Mat blurred = gaussianBlur(gray, options.gaussianSigma);
+        cv::Mat adaptive = adaptiveThreshold(blurred, options.blockSize, options.C);
+        cv::Mat edges = cannyEdges(blurred, options.cannyLow, options.cannyHigh, options.cannyAperture);
         
         extractDefectContours(adaptive, edges, blurred, result.opaqueDefects, result.clearDefects);
         

@@ -67,56 +67,104 @@ contextBridge.exposeInMainWorld('electronAPI', {
   }
 });
 
+function withTimeout(promise, ms, opName) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`[ebeamNative] Operation '${opName}' timed out after ${ms}ms`));
+    }, ms);
+    promise.then(
+      (val) => { clearTimeout(timer); resolve(val); },
+      (err) => { clearTimeout(timer); reject(err); }
+    );
+  });
+}
+
+function makeSafeAsync(fn, opName, fallbackFn, timeoutMs = 120000) {
+  return async (...args) => {
+    const mod = loadNativeModule();
+    try {
+      if (mod && fn(mod)) {
+        const result = await withTimeout(
+          Promise.resolve(fn(mod).apply(mod, args)),
+          timeoutMs,
+          opName
+        );
+        return result;
+      }
+    } catch (nativeErr) {
+      console.warn(`[Preload] Native ${opName} failed:`, nativeErr.message);
+      console.warn(`[Preload] Falling back to JS implementation`);
+    }
+    return fallbackFn.apply(null, args);
+  };
+}
+
 contextBridge.exposeInMainWorld('ebeamNative', {
   isLoaded: () => {
     return loadNativeModule() !== null;
   },
 
+  isAsyncNative: () => {
+    const mod = loadNativeModule();
+    return !!(mod && mod.isAsyncNative);
+  },
+
+  getThreadPool: () => {
+    const mod = loadNativeModule();
+    return mod && mod.threadPool ? mod.threadPool : 'JS Main Thread (Fallback)';
+  },
+
   getVersion: () => {
     const mod = loadNativeModule();
     if (mod && mod.getVersion) return mod.getVersion();
-    return 'js-fallback-1.0.0';
+    return 'js-fallback-1.0.0-async';
   },
 
-  detectDefects: async (imageData, options = {}) => {
-    const mod = loadNativeModule();
-    if (mod && mod.detectDefects) {
-      return mod.detectDefects(imageData, options);
-    }
-    return fallbackDetectDefects(imageData, options);
-  },
+  detectDefects: makeSafeAsync(
+    (m) => m.detectDefects,
+    'detectDefects',
+    fallbackDetectDefects,
+    180000
+  ),
 
-  generateRasterScan: async (polygonPoints, options = {}) => {
-    const mod = loadNativeModule();
-    if (mod && mod.generateRasterScan) {
-      return mod.generateRasterScan(polygonPoints, options);
-    }
-    return fallbackGenerateRasterScan(polygonPoints, options);
-  },
+  detectDefectsFromFile: makeSafeAsync(
+    (m) => m.detectDefectsFromFile,
+    'detectDefectsFromFile',
+    async (filePath, options = {}) => {
+      const buf = await ipcRenderer.invoke('fs:read-image-buffer', filePath);
+      if (!buf || !buf.data) throw new Error('Failed to read image: ' + filePath);
+      return fallbackDetectDefects(buf, options);
+    },
+    180000
+  ),
 
-  buildDoseMatrix: async (scanPoints, materialMap = {}, options = {}) => {
-    const mod = loadNativeModule();
-    if (mod && mod.buildDoseMatrix) {
-      return mod.buildDoseMatrix(scanPoints, materialMap, options);
-    }
-    return fallbackBuildDoseMatrix(scanPoints, materialMap, options);
-  },
+  generateRasterScan: makeSafeAsync(
+    (m) => m.generateRasterScan,
+    'generateRasterScan',
+    fallbackGenerateRasterScan,
+    60000
+  ),
 
-  processMultiLayer: async (layers, options = {}) => {
-    const mod = loadNativeModule();
-    if (mod && mod.processMultiLayer) {
-      return mod.processMultiLayer(layers, options);
-    }
-    return fallbackProcessMultiLayer(layers, options);
-  },
+  buildDoseMatrix: makeSafeAsync(
+    (m) => m.buildDoseMatrix,
+    'buildDoseMatrix',
+    fallbackBuildDoseMatrix,
+    60000
+  ),
 
-  subpixelRefineContour: async (contour, imageData, options = {}) => {
-    const mod = loadNativeModule();
-    if (mod && mod.subpixelRefineContour) {
-      return mod.subpixelRefineContour(contour, imageData, options);
-    }
-    return fallbackSubpixelRefine(contour, imageData, options);
-  }
+  processMultiLayer: makeSafeAsync(
+    (m) => m.processMultiLayer,
+    'processMultiLayer',
+    fallbackProcessMultiLayer,
+    300000
+  ),
+
+  subpixelRefineContour: makeSafeAsync(
+    (m) => m.subpixelRefineContour,
+    'subpixelRefineContour',
+    fallbackSubpixelRefine,
+    60000
+  )
 });
 
 // ==================== JavaScript Fallbacks ====================

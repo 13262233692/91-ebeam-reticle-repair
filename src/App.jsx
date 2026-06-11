@@ -4,8 +4,8 @@ import ImageViewer from './components/ImageViewer.jsx';
 import DefectPanel from './components/DefectPanel.jsx';
 import RepairSimulator3D from './components/RepairSimulator3D.jsx';
 import ConsoleLog from './components/ConsoleLog.jsx';
-import { addLog, formatArea } from '../utils/imageUtils.js';
-import { getBBoxFromDefects, buildSvgDef, formatDose, formatDwellTime } from '../utils/svgUtils.js';
+import { addLog, formatArea } from './utils/imageUtils.js';
+import { getBBoxFromDefects, buildSvgDef, formatDose, formatDwellTime } from './utils/svgUtils.js';
 
 export default function App() {
   const [imageData, setImageData] = useState(null);
