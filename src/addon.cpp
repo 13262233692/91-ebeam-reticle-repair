@@ -2,6 +2,7 @@
 #include "image_processor.h"
 #include "scan_path_generator.h"
 #include "dose_matrix_builder.h"
+#include "pec_corrector.h"
 #include "common.h"
 #include <memory>
 #include <string>
@@ -14,10 +15,11 @@
 static ImageProcessor g_imageProcessor;
 static ScanPathGenerator g_scanGen;
 static DoseMatrixBuilder g_doseBuilder;
+static PECCorrector g_pecCorrector;
 static std::mutex g_procMutex;
 
 Napi::Value GetVersion(const Napi::CallbackInfo& info) {
-    return Napi::String::New(info.Env(), "ebeam-repair-native-v1.1.0-async-opencv4.8.0");
+    return Napi::String::New(info.Env(), "ebeam-repair-native-v1.2.0-pec-async-opencv4.8.0");
 }
 
 // ============================================================
@@ -162,6 +164,90 @@ struct SubpixelOptions {
             o.type = obj.Get("type").As<Napi::String>().Utf8Value();
         if (obj.Has("sigma") && obj.Get("sigma").IsNumber())
             o.sigma = obj.Get("sigma").As<Napi::Number>().DoubleValue();
+        return o;
+    }
+};
+
+struct PSFOptions {
+    double eta = 0.45;
+    double alpha = 2.5;
+    double beta = 25.0;
+    double gamma = 0.9;
+
+    static PSFOptions fromNapi(Napi::Object obj) {
+        PSFOptions o;
+        if (obj.IsEmpty() || obj.IsNull() || obj.IsUndefined()) return o;
+        if (obj.Has("eta") && obj.Get("eta").IsNumber())
+            o.eta = obj.Get("eta").As<Napi::Number>().DoubleValue();
+        if (obj.Has("alpha") && obj.Get("alpha").IsNumber())
+            o.alpha = obj.Get("alpha").As<Napi::Number>().DoubleValue();
+        if (obj.Has("beta") && obj.Get("beta").IsNumber())
+            o.beta = obj.Get("beta").As<Napi::Number>().DoubleValue();
+        if (obj.Has("gamma") && obj.Get("gamma").IsNumber())
+            o.gamma = obj.Get("gamma").As<Napi::Number>().DoubleValue();
+        return o;
+    }
+
+    DualGaussianPSF toPure() const {
+        DualGaussianPSF p;
+        p.eta = eta;
+        p.alpha = alpha;
+        p.beta = beta;
+        p.gamma = gamma;
+        return p;
+    }
+};
+
+struct PECAlgorithmOptions {
+    int iterations = 5;
+    double regularizationLambda = 0.001;
+    bool applyDogBoneEnhance = true;
+    double dogBoneStrength = 1.15;
+    double edgeBoostSigma = 1.0;
+    double cornerBoostSigma = 1.5;
+    double maxDoseMultiplier = 2.5;
+    double minDoseMultiplier = 0.5;
+    bool useWienerFilter = false;
+    double wienerSNR = 30.0;
+
+    static PECAlgorithmOptions fromNapi(Napi::Object obj) {
+        PECAlgorithmOptions o;
+        if (obj.IsEmpty() || obj.IsNull() || obj.IsUndefined()) return o;
+        if (obj.Has("iterations") && obj.Get("iterations").IsNumber())
+            o.iterations = obj.Get("iterations").As<Napi::Number>().Int32Value();
+        if (obj.Has("regularizationLambda") && obj.Get("regularizationLambda").IsNumber())
+            o.regularizationLambda = obj.Get("regularizationLambda").As<Napi::Number>().DoubleValue();
+        if (obj.Has("applyDogBoneEnhance") && obj.Get("applyDogBoneEnhance").IsBoolean())
+            o.applyDogBoneEnhance = obj.Get("applyDogBoneEnhance").As<Napi::Boolean>().Value();
+        if (obj.Has("dogBoneStrength") && obj.Get("dogBoneStrength").IsNumber())
+            o.dogBoneStrength = obj.Get("dogBoneStrength").As<Napi::Number>().DoubleValue();
+        if (obj.Has("edgeBoostSigma") && obj.Get("edgeBoostSigma").IsNumber())
+            o.edgeBoostSigma = obj.Get("edgeBoostSigma").As<Napi::Number>().DoubleValue();
+        if (obj.Has("cornerBoostSigma") && obj.Get("cornerBoostSigma").IsNumber())
+            o.cornerBoostSigma = obj.Get("cornerBoostSigma").As<Napi::Number>().DoubleValue();
+        if (obj.Has("maxDoseMultiplier") && obj.Get("maxDoseMultiplier").IsNumber())
+            o.maxDoseMultiplier = obj.Get("maxDoseMultiplier").As<Napi::Number>().DoubleValue();
+        if (obj.Has("minDoseMultiplier") && obj.Get("minDoseMultiplier").IsNumber())
+            o.minDoseMultiplier = obj.Get("minDoseMultiplier").As<Napi::Number>().DoubleValue();
+        if (obj.Has("useWienerFilter") && obj.Get("useWienerFilter").IsBoolean())
+            o.useWienerFilter = obj.Get("useWienerFilter").As<Napi::Boolean>().Value();
+        if (obj.Has("wienerSNR") && obj.Get("wienerSNR").IsNumber())
+            o.wienerSNR = obj.Get("wienerSNR").As<Napi::Number>().DoubleValue();
+        return o;
+    }
+
+    PECOptions toPure() const {
+        PECOptions o;
+        o.iterations = iterations;
+        o.regularizationLambda = regularizationLambda;
+        o.applyDogBoneEnhance = applyDogBoneEnhance;
+        o.dogBoneStrength = dogBoneStrength;
+        o.edgeBoostSigma = edgeBoostSigma;
+        o.cornerBoostSigma = cornerBoostSigma;
+        o.maxDoseMultiplier = maxDoseMultiplier;
+        o.minDoseMultiplier = minDoseMultiplier;
+        o.useWienerFilter = useWienerFilter;
+        o.wienerSNR = wienerSNR;
         return o;
     }
 };
@@ -1105,6 +1191,179 @@ Napi::Value ProcessMultiLayerAsync(const Napi::CallbackInfo& info) {
 }
 
 // ============================================================
+// AsyncWorker: ApplyPECCorrectionAsync (频域邻近效应校正)
+// ============================================================
+
+class ApplyPECCorrectionWorker : public Napi::AsyncWorker {
+public:
+    ApplyPECCorrectionWorker(Napi::Function& callback,
+                             ScanPathResult scanPath,
+                             int width, int height,
+                             PSFOptions psfOpts,
+                             PECAlgorithmOptions pecOpts)
+        : Napi::AsyncWorker(callback),
+          scanPath_(std::move(scanPath)),
+          w_(width), h_(height),
+          psfPure_(psfOpts.toPure()),
+          pecPure_(pecOpts.toPure()) {}
+
+    void Execute() override {
+        try {
+            std::lock_guard<std::mutex> lock(g_procMutex);
+
+            result_ = g_pecCorrector.applyCorrection(
+                scanPath_.scanLines,
+                w_, h_,
+                psfPure_, pecPure_
+            );
+
+            if (result_.success) {
+                correctedScanPath_ = scanPath_;
+                correctedScanPath_.scanLines = g_pecCorrector.scanPointsFromDoseMap(
+                    result_.correctedDoseMap,
+                    scanPath_.scanLines
+                );
+            }
+        } catch (const std::exception& e) {
+            SetError(std::string("PEC C++ error: ") + e.what());
+        }
+    }
+
+    void OnOK() override {
+        Napi::Env env = Env();
+        auto out = Napi::Object::New(env);
+        out.Set("success", Napi::Boolean::New(env, result_.success));
+        out.Set("native", Napi::Boolean::New(env, result_.native));
+        out.Set("async", Napi::Boolean::New(env, true));
+
+        auto linesArr = Napi::Array::New(env, correctedScanPath_.scanLines.size());
+        for (size_t i = 0; i < correctedScanPath_.scanLines.size(); ++i) {
+            linesArr.Set(i, scanLineToNapi(env, correctedScanPath_.scanLines[i]));
+        }
+        out.Set("correctedScanLines", linesArr);
+
+        auto stats = Napi::Object::New(env);
+        stats.Set("iterations", Napi::Number::New(env, result_.iterations));
+        stats.Set("processingTimeMs", Napi::Number::New(env, result_.processingTimeMs));
+        stats.Set("maxCorrectionFactor", Napi::Number::New(env, result_.maxCorrectionFactor));
+        stats.Set("minCorrectionFactor", Napi::Number::New(env, result_.minCorrectionFactor));
+        stats.Set("avgCorrectionFactor", Napi::Number::New(env, result_.avgCorrectionFactor));
+        stats.Set("width", Napi::Number::New(env, result_.width));
+        stats.Set("height", Napi::Number::New(env, result_.height));
+        out.Set("stats", stats);
+
+        auto psfMeta = Napi::Object::New(env);
+        psfMeta.Set("eta", Napi::Number::New(env, psfPure_.eta));
+        psfMeta.Set("alpha", Napi::Number::New(env, psfPure_.alpha));
+        psfMeta.Set("beta", Napi::Number::New(env, psfPure_.beta));
+        psfMeta.Set("gamma", Napi::Number::New(env, psfPure_.gamma));
+        psfMeta.Set("kernelSize", Napi::Number::New(env, result_.psfKernel.cols));
+        out.Set("psf", psfMeta);
+
+        auto algoMeta = Napi::Object::New(env);
+        algoMeta.Set("applyDogBoneEnhance", Napi::Boolean::New(env, pecPure_.applyDogBoneEnhance));
+        algoMeta.Set("dogBoneStrength", Napi::Number::New(env, pecPure_.dogBoneStrength));
+        algoMeta.Set("useWienerFilter", Napi::Boolean::New(env, pecPure_.useWienerFilter));
+        algoMeta.Set("maxDoseMultiplier", Napi::Number::New(env, pecPure_.maxDoseMultiplier));
+        out.Set("algorithm", algoMeta);
+
+        if (!result_.errorMessage.empty()) {
+            out.Set("error", Napi::String::New(env, result_.errorMessage));
+        }
+
+        Callback().Call({env.Null(), out});
+    }
+
+    void OnError(const Napi::Error& e) override {
+        Napi::Env env = Env();
+        Callback().Call({e.Value(), env.Null()});
+    }
+
+private:
+    ScanPathResult scanPath_;
+    ScanPathResult correctedScanPath_;
+    int w_, h_;
+    DualGaussianPSF psfPure_;
+    PECOptions pecPure_;
+    PECResult result_;
+};
+
+Napi::Value ApplyPECCorrectionAsync(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 3) {
+        Napi::Error::New(env, "Expected scanLines, width, height arguments").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    try {
+        ScanPathResult scanPath = parseScanLinesFromNapi(info[0]);
+        int width = info[1].As<Napi::Number>().Int32Value();
+        int height = info[2].As<Napi::Number>().Int32Value();
+        Napi::Object psfObj = info.Length() >= 4 && info[3].IsObject() ? info[3].As<Napi::Object>() : Napi::Object::New(env);
+        Napi::Object pecObj = info.Length() >= 5 && info[4].IsObject() ? info[4].As<Napi::Object>() : Napi::Object::New(env);
+
+        PSFOptions psfOpts = PSFOptions::fromNapi(psfObj);
+        PECAlgorithmOptions pecOpts = PECAlgorithmOptions::fromNapi(pecObj);
+
+        auto deferred = Napi::Promise::Deferred::New(env);
+        auto callback = Napi::Function::New(env, [deferred](const Napi::CallbackInfo& cb) mutable {
+            if (cb.Length() > 0 && !cb[0].IsNull() && !cb[0].IsUndefined()) {
+                deferred.Reject(cb[0].ToObject());
+            } else {
+                deferred.Resolve(cb[1]);
+            }
+        });
+
+        auto* worker = new ApplyPECCorrectionWorker(callback, std::move(scanPath), width, height, psfOpts, pecOpts);
+        worker->Queue();
+        return deferred.Promise();
+    } catch (const std::exception& e) {
+        Napi::Error::New(env, std::string("C++ exception in applyPECCorrection: ") + e.what()).ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+}
+
+Napi::Value GeneratePSFKernelAsync(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    try {
+        int kernelSize = info.Length() >= 1 ? info[0].As<Napi::Number>().Int32Value() : 101;
+        Napi::Object psfObj = info.Length() >= 2 && info[1].IsObject() ? info[1].As<Napi::Object>() : Napi::Object::New(env);
+        PSFOptions psfOpts = PSFOptions::fromNapi(psfObj);
+
+        if (kernelSize < 3) kernelSize = 3;
+        if (kernelSize % 2 == 0) kernelSize++;
+
+        std::lock_guard<std::mutex> lock(g_procMutex);
+        DualGaussianPSF psfPure = psfOpts.toPure();
+        cv::Mat kernel = g_pecCorrector.generateDualGaussianPSF(kernelSize, psfPure);
+
+        auto out = Napi::Object::New(env);
+        out.Set("success", Napi::Boolean::New(env, true));
+        out.Set("kernelSize", Napi::Number::New(env, kernel.cols));
+        out.Set("eta", Napi::Number::New(env, psfPure.eta));
+        out.Set("alpha", Napi::Number::New(env, psfPure.alpha));
+        out.Set("beta", Napi::Number::New(env, psfPure.beta));
+
+        const int half = kernel.cols / 2;
+        auto crossSection = Napi::Array::New(env, kernel.cols);
+        const double* midRow = kernel.ptr<double>(half);
+        double maxK = 0.0;
+        for (int i = 0; i < kernel.cols; i++) {
+            if (midRow[i] > maxK) maxK = midRow[i];
+        }
+        if (maxK < 1e-12) maxK = 1.0;
+        for (int i = 0; i < kernel.cols; i++) {
+            crossSection.Set(i, Napi::Number::New(env, midRow[i] / maxK));
+        }
+        out.Set("crossSection", crossSection);
+
+        return out;
+    } catch (const std::exception& e) {
+        Napi::Error::New(env, std::string("C++ exception in generatePSFKernel: ") + e.what()).ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+}
+
+// ============================================================
 // 同步版本保留用于向后兼容 (但强烈不建议使用)
 // ============================================================
 
@@ -1167,12 +1426,17 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("subpixelRefineContour", Napi::Function::New(env, SubpixelRefineContourAsync));
     exports.Set("processMultiLayer", Napi::Function::New(env, ProcessMultiLayerAsync));
 
+    // PEC 光刻邻近效应校正 (频域反卷积 + 双高斯 PSF)
+    exports.Set("applyPECCorrection", Napi::Function::New(env, ApplyPECCorrectionAsync));
+    exports.Set("generatePSFKernel", Napi::Function::New(env, GeneratePSFKernelAsync));
+
     // 同步版本保留但标记 deprecated，用于向后兼容
     exports.Set("detectDefectsSync", Napi::Function::New(env, DetectDefectsSync));
 
     // 版本和运行模式信息
     exports.Set("isAsyncNative", Napi::Boolean::New(env, true));
-    exports.Set("threadPool", Napi::String::New(env, "libuv AsyncWorker Pool"));
+    exports.Set("supportsPEC", Napi::Boolean::New(env, true));
+    exports.Set("threadPool", Napi::String::New(env, "libuv AsyncWorker Pool + DFT Deconvolution"));
 
     return exports;
 }

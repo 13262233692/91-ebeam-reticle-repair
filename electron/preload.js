@@ -164,7 +164,26 @@ contextBridge.exposeInMainWorld('ebeamNative', {
     'subpixelRefineContour',
     fallbackSubpixelRefine,
     60000
-  )
+  ),
+
+  applyPECCorrection: makeSafeAsync(
+    (m) => m.applyPECCorrection,
+    'applyPECCorrection',
+    fallbackApplyPECCorrection,
+    600000
+  ),
+
+  generatePSFKernel: makeSafeAsync(
+    (m) => m.generatePSFKernel,
+    'generatePSFKernel',
+    async (kernelSize = 101, psfParams = {}) => fallbackGeneratePSFKernel(kernelSize, psfParams),
+    30000
+  ),
+
+  supportsPEC: () => {
+    const mod = loadNativeModule();
+    return !!(mod && mod.supportsPEC);
+  }
 });
 
 // ==================== JavaScript Fallbacks ====================
@@ -746,4 +765,252 @@ function fallbackSubpixelRefine(contour, imageData, options) {
   
   const blurred = gaussianBlur(gray, width, height, 1.0);
   return subpixelRefineJS(contour, blurred, width, height, options.type || 'opaque');
+}
+
+// ==================== PEC JS Fallback ====================
+
+function generateDualGaussianPSF_JS(kernelSize, params) {
+  const { eta = 0.45, alpha = 2.5, beta = 25.0, gamma = 0.9 } = params;
+  if (kernelSize % 2 === 0) kernelSize++;
+  const half = Math.floor(kernelSize / 2);
+  const psf = new Float64Array(kernelSize * kernelSize);
+  const twoAlpha2 = 2.0 * alpha * alpha;
+  const twoBeta2 = 2.0 * beta * beta;
+  const invGamma2 = 1.0 / (gamma * gamma);
+  let sum = 0;
+
+  for (let y = -half; y <= half; y++) {
+    for (let x = -half; x <= half; x++) {
+      const r2 = x * x + y * y;
+      const forward = (1 - eta) * Math.exp(-r2 * invGamma2 / twoAlpha2);
+      const backward = eta * Math.exp(-r2 * invGamma2 / twoBeta2);
+      const idx = (y + half) * kernelSize + (x + half);
+      psf[idx] = forward + backward;
+      sum += psf[idx];
+    }
+  }
+
+  for (let i = 0; i < psf.length; i++) psf[i] /= sum;
+  return psf;
+}
+
+function convolve2DSpatial(image, w, h, kernel, ksize) {
+  const half = Math.floor(ksize / 2);
+  const out = new Float64Array(w * h);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      let acc = 0;
+      for (let ky = -half; ky <= half; ky++) {
+        const sy = Math.min(h - 1, Math.max(0, y + ky));
+        for (let kx = -half; kx <= half; kx++) {
+          const sx = Math.min(w - 1, Math.max(0, x + kx));
+          const kval = kernel[(ky + half) * ksize + (kx + half)];
+          acc += image[sy * w + sx] * kval;
+        }
+      }
+      out[y * w + x] = acc;
+    }
+  }
+  return out;
+}
+
+function buildDoseMapFromScanLines(scanLines, width, height) {
+  const map = new Float64Array(width * height);
+  for (const line of scanLines) {
+    for (const pt of line.points) {
+      const px = Math.round(pt.x);
+      const py = Math.round(pt.y);
+      if (px >= 0 && px < width && py >= 0 && py < height) {
+        map[py * width + px] += (pt.dose > 0 ? pt.dose : 1.0);
+      }
+    }
+  }
+  let maxD = 0;
+  for (let i = 0; i < map.length; i++) if (map[i] > maxD) maxD = map[i];
+  if (maxD > 1e-9) for (let i = 0; i < map.length; i++) map[i] /= maxD;
+  return map;
+}
+
+function richardsonLucy_JS(blurred, w, h, psf, psfSize, iterations, lambda) {
+  let estimate = new Float64Array(blurred);
+  const kHalf = Math.floor(psfSize / 2);
+  const psfFlip = new Float64Array(psf.length);
+  for (let y = 0; y < psfSize; y++) {
+    for (let x = 0; x < psfSize; x++) {
+      psfFlip[y * psfSize + x] = psf[(psfSize - 1 - y) * psfSize + (psfSize - 1 - x)];
+    }
+  }
+
+  for (let it = 0; it < iterations; it++) {
+    const convolved = convolve2DSpatial(estimate, w, h, psf, psfSize);
+    const ratio = new Float64Array(w * h);
+    for (let i = 0; i < ratio.length; i++) {
+      ratio[i] = (blurred[i] + 1e-9) / (convolved[i] + 1e-9);
+    }
+    const correction = convolve2DSpatial(ratio, w, h, psfFlip, psfSize);
+    for (let i = 0; i < estimate.length; i++) {
+      estimate[i] = estimate[i] * correction[i];
+    }
+  }
+  return estimate;
+}
+
+function enhanceDogBone_JS(doseMap, w, h, strength, edgeSigma, cornerSigma) {
+  const enhanced = new Float64Array(doseMap);
+  const blurredE = gaussianBlur(doseMap, w, h, edgeSigma);
+  const blurredC = gaussianBlur(doseMap, w, h, cornerSigma);
+
+  const edgeMap = new Float64Array(w * h);
+  const kernelLap = [0, 1, 0, 1, -4, 1, 0, 1, 0];
+  const lap = convolve2DSpatial(blurredE, w, h, new Float64Array(kernelLap.map(k => k)), 3);
+  let emax = 0;
+  for (let i = 0; i < lap.length; i++) {
+    edgeMap[i] = Math.abs(lap[i]);
+    if (edgeMap[i] > emax) emax = edgeMap[i];
+  }
+  if (emax > 1e-9) for (let i = 0; i < edgeMap.length; i++) edgeMap[i] /= emax;
+
+  const cornerMap = new Float64Array(w * h);
+  const sobelX = [-1, 0, 1, -2, 0, 2, -1, 0, 1];
+  const sobelY = [-1, -2, -1, 0, 0, 0, 1, 2, 1];
+  const gx = convolve2DSpatial(blurredC, w, h, new Float64Array(sobelX), 3);
+  const gy = convolve2DSpatial(blurredC, w, h, new Float64Array(sobelY), 3);
+  let cmax = 0;
+  for (let i = 0; i < gx.length; i++) {
+    cornerMap[i] = Math.abs(gx[i] * gy[i]);
+    if (cornerMap[i] > cmax) cmax = cornerMap[i];
+  }
+  if (cmax > 1e-9) for (let i = 0; i < cornerMap.length; i++) cornerMap[i] /= cmax;
+
+  const edgeBoost = (strength - 1) * 0.5 + 1;
+  const cornerBoost = strength;
+  for (let i = 0; i < enhanced.length; i++) {
+    enhanced[i] = enhanced[i] * (1 + (edgeBoost - 1) * edgeMap[i]);
+    enhanced[i] = enhanced[i] * (1 + (cornerBoost - 1) * cornerMap[i]);
+  }
+  return enhanced;
+}
+
+function fallbackGeneratePSFKernel(kernelSize = 101, psfParams = {}) {
+  const eta = psfParams.eta ?? 0.45;
+  const alpha = psfParams.alpha ?? 2.5;
+  const beta = psfParams.beta ?? 25.0;
+  const psf = generateDualGaussianPSF_JS(kernelSize, psfParams);
+  const ks = Math.floor(Math.sqrt(psf.length));
+  const half = Math.floor(ks / 2);
+  const crossSection = [];
+  let maxK = 0;
+  for (let i = 0; i < ks; i++) {
+    if (psf[half * ks + i] > maxK) maxK = psf[half * ks + i];
+  }
+  if (maxK < 1e-9) maxK = 1;
+  for (let i = 0; i < ks; i++) {
+    crossSection.push(psf[half * ks + i] / maxK);
+  }
+  return {
+    success: true,
+    kernelSize: ks,
+    eta,
+    alpha,
+    beta,
+    crossSection
+  };
+}
+
+async function fallbackApplyPECCorrection(scanLines, width, height, psfParams = {}, pecOptions = {}) {
+  return new Promise((resolve) => {
+    const t0 = performance.now();
+
+    const eta = psfParams.eta ?? 0.45;
+    const alpha = psfParams.alpha ?? 2.5;
+    const beta = psfParams.beta ?? 25.0;
+    const gamma = psfParams.gamma ?? 0.9;
+
+    const iterations = pecOptions.iterations ?? 3;
+    const dogBone = pecOptions.applyDogBoneEnhance ?? true;
+    const dogBoneStrength = pecOptions.dogBoneStrength ?? 1.15;
+    const maxMult = pecOptions.maxDoseMultiplier ?? 2.5;
+    const minMult = pecOptions.minDoseMultiplier ?? 0.5;
+
+    const psfSize = Math.max(21, Math.ceil(beta * 3)) | 1;
+    const psf = generateDualGaussianPSF_JS(psfSize, { eta, alpha, beta, gamma });
+
+    const original = buildDoseMapFromScanLines(scanLines, width, height);
+    const deconvolved = richardsonLucy_JS(original, width, height, psf, psfSize, iterations, 0.001);
+
+    let finalMap;
+    if (dogBone) {
+      finalMap = enhanceDogBone_JS(deconvolved, width, height, dogBoneStrength, 1.0, 1.5);
+    } else {
+      finalMap = deconvolved;
+    }
+
+    let origMean = 0;
+    for (let i = 0; i < original.length; i++) origMean += original[i];
+    origMean /= original.length;
+    let finalMean = 0;
+    for (let i = 0; i < finalMap.length; i++) finalMean += finalMap[i];
+    finalMean /= finalMap.length;
+    if (finalMean > 1e-9) {
+      const s = origMean / finalMean;
+      for (let i = 0; i < finalMap.length; i++) finalMap[i] *= s;
+    }
+
+    const ratio = new Float64Array(original.length);
+    let maxF = 1, minF = 1, avgF = 0;
+    for (let i = 0; i < original.length; i++) {
+      const r = (finalMap[i] + 1e-9) / (original[i] + 1e-9);
+      ratio[i] = Math.min(maxMult, Math.max(minMult, r));
+      if (ratio[i] > maxF) maxF = ratio[i];
+      if (ratio[i] < minF) minF = ratio[i];
+      avgF += ratio[i];
+    }
+    avgF /= ratio.length;
+
+    const correctedScanLines = [];
+    for (const line of scanLines) {
+      const pts = [];
+      for (const pt of line.points) {
+        const px = Math.round(pt.x);
+        const py = Math.round(pt.y);
+        let cf = 1;
+        if (px >= 0 && px < width && py >= 0 && py < height) {
+          cf = ratio[py * width + px];
+          if (cf < 0.1) cf = 0.1;
+        }
+        pts.push({
+          x: pt.x, y: pt.y, z: pt.z ?? 0,
+          dwellTime: pt.dwellTime ? Math.round(pt.dwellTime * cf) : 0,
+          dose: (pt.dose ?? 1) * cf,
+          layerIndex: pt.layerIndex ?? 0,
+          scanIndex: pt.scanIndex ?? 0
+        });
+      }
+      correctedScanLines.push({ ...line, points: pts });
+    }
+
+    const t1 = performance.now();
+    resolve({
+      success: true,
+      native: false,
+      async: true,
+      correctedScanLines,
+      stats: {
+        iterations,
+        processingTimeMs: t1 - t0,
+        maxCorrectionFactor: maxF,
+        minCorrectionFactor: minF,
+        avgCorrectionFactor: avgF,
+        width,
+        height
+      },
+      psf: { eta, alpha, beta, gamma, kernelSize: psfSize },
+      algorithm: {
+        applyDogBoneEnhance: dogBone,
+        dogBoneStrength,
+        useWienerFilter: false,
+        maxDoseMultiplier: maxMult
+      }
+    });
+  });
 }

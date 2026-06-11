@@ -15,6 +15,7 @@ export default function App() {
   const [selectedDefectId, setSelectedDefectId] = useState(null);
   const [hoveredDefectId, setHoveredDefectId] = useState(null);
   const [scanPathResult, setScanPathResult] = useState(null);
+  const [pecResult, setPecResult] = useState(null);
   const [doseMatrixResult, setDoseMatrixResult] = useState(null);
   const [logs, setLogs] = useState([]);
   const [processing, setProcessing] = useState(null);
@@ -24,6 +25,7 @@ export default function App() {
   const [showOpaque, setShowOpaque] = useState(true);
   const [showClear, setShowClear] = useState(true);
   const [showScanPath, setShowScanPath] = useState(true);
+  const [pecEnabled, setPecEnabled] = useState(true);
   const [processingParams, setProcessingParams] = useState({
     gaussianSigma: 1.5,
     blockSize: 31,
@@ -35,7 +37,22 @@ export default function App() {
     overlap: 0.3,
     scanMode: 'hybrid',
     beamVoltage: 30,
-    baseDwellTime: 500
+    baseDwellTime: 500,
+    pec: {
+      enabled: true,
+      eta: 0.45,
+      alpha: 2.5,
+      beta: 25.0,
+      gamma: 0.9,
+      iterations: 5,
+      regularizationLambda: 0.001,
+      applyDogBoneEnhance: true,
+      dogBoneStrength: 1.15,
+      maxDoseMultiplier: 2.5,
+      minDoseMultiplier: 0.5,
+      useWienerFilter: false,
+      wienerSNR: 30.0
+    }
   });
 
   const appendLog = useCallback((msg, type = 'info') => {
@@ -327,6 +344,88 @@ export default function App() {
     }
   }, [scanPathResult, processingParams, appendLog]);
 
+  const handleApplyPEC = useCallback(async () => {
+    if (!scanPathResult) {
+      appendLog('请先生成扫描路径', 'warn');
+      return;
+    }
+    const pecCfg = processingParams.pec || {};
+    if (!pecCfg.enabled && !processingParams._forcePEC) {
+      appendLog('PEC 校正未启用', 'warn');
+    }
+
+    const w = imageData?.width || (detectionResult?.meta?.width) || 2048;
+    const h = imageData?.height || (detectionResult?.meta?.height) || 2048;
+
+    try {
+      setProcessing('PEC邻近效应校正');
+      setProgress(5);
+      appendLog(
+        `启动 PEC 频域校正: α=${pecCfg.alpha?.toFixed(1)}nm β=${pecCfg.beta?.toFixed(1)}nm η=${pecCfg.eta?.toFixed(2)} ` +
+        `${pecCfg.applyDogBoneEnhance ? 'Dog-bone ' + pecCfg.dogBoneStrength?.toFixed(2) + '× 增强' : ''}`,
+        'info'
+      );
+
+      const psfParams = {
+        eta: pecCfg.eta ?? 0.45,
+        alpha: pecCfg.alpha ?? 2.5,
+        beta: pecCfg.beta ?? 25.0,
+        gamma: pecCfg.gamma ?? 0.9
+      };
+      const pecOpts = {
+        iterations: pecCfg.iterations ?? 5,
+        regularizationLambda: pecCfg.regularizationLambda ?? 0.001,
+        applyDogBoneEnhance: pecCfg.applyDogBoneEnhance ?? true,
+        dogBoneStrength: pecCfg.dogBoneStrength ?? 1.15,
+        maxDoseMultiplier: pecCfg.maxDoseMultiplier ?? 2.5,
+        minDoseMultiplier: pecCfg.minDoseMultiplier ?? 0.5,
+        useWienerFilter: pecCfg.useWienerFilter ?? false,
+        wienerSNR: pecCfg.wienerSNR ?? 30.0
+      };
+
+      setProgress(25);
+      const res = await window.ebeamNative.applyPECCorrection(
+        scanPathResult.scanLines, w, h, psfParams, pecOpts
+      );
+      setProgress(85);
+
+      if (res.success) {
+        setPecResult(res);
+        setScanPathResult(prev => prev ? {
+          ...prev,
+          scanLines: res.correctedScanLines,
+          pecApplied: true,
+          pecStats: res.stats,
+          pecPSF: res.psf,
+          pecAlgorithm: res.algorithm
+        } : prev);
+
+        const s = res.stats || {};
+        appendLog(
+          `PEC 校正完成: ${s.iterations} 次迭代, 耗时 ${(s.processingTimeMs || 0).toFixed(1)}ms`,
+          'success'
+        );
+        appendLog(
+          `校正系数: 最小 ${(s.minCorrectionFactor || 1).toFixed(3)}×, ` +
+          `最大 ${(s.maxCorrectionFactor || 1).toFixed(3)}×, ` +
+          `平均 ${(s.avgCorrectionFactor || 1).toFixed(3)}×`,
+          'info'
+        );
+        if (res.algorithm?.applyDogBoneEnhance) {
+          appendLog(`Dog-bone 异形增强强度: ${(res.algorithm.dogBoneStrength || 1.15).toFixed(2)}×`, 'info');
+        }
+      } else {
+        appendLog(`PEC 校正失败: ${res.error || '未知'}`, 'error');
+      }
+
+      setProgress(100);
+      setTimeout(() => { setProcessing(null); setProgress(0); }, 400);
+    } catch (err) {
+      appendLog(`PEC 校正异常: ${err.message}`, 'error');
+      setProcessing(null);
+    }
+  }, [scanPathResult, processingParams, imageData, detectionResult, appendLog]);
+
   const handleRunSimulation = useCallback(async () => {
     if (!detectionResult) {
       appendLog('请先完成缺陷检测', 'warn');
@@ -481,6 +580,14 @@ export default function App() {
           <button className="header-btn" onClick={handleGenerateScanPath} disabled={!detectionResult || processing}>
             <span>🛣️</span> 扫描路径
           </button>
+          <button
+            className="header-btn"
+            style={{ background: processingParams?.pec?.enabled ? 'rgba(120, 180, 255, 0.15)' : 'transparent' }}
+            onClick={handleApplyPEC}
+            disabled={!scanPathResult || processing}
+          >
+            <span>🧠</span> PEC校正
+          </button>
           <button className="header-btn" onClick={handleBuildDoseMatrix} disabled={!scanPathResult || processing}>
             <span>⚡</span> 剂量矩阵
           </button>
@@ -512,6 +619,7 @@ export default function App() {
           onLoadImage={handleLoadImage}
           onRunDetection={handleRunDetection}
           onGenerateScanPath={handleGenerateScanPath}
+          onApplyPEC={handleApplyPEC}
           onBuildDoseMatrix={handleBuildDoseMatrix}
           onExportCommands={handleExportCommands}
           onExportSvg={handleExportSvg}
@@ -520,10 +628,13 @@ export default function App() {
           imageData={imageData}
           detectionResult={detectionResult}
           scanPathResult={scanPathResult}
+          pecResult={pecResult}
           doseMatrixResult={doseMatrixResult}
           layers={layers}
           currentLayerIdx={currentLayerIdx}
           onLayerChange={handleLayerChange}
+          pecEnabled={pecEnabled}
+          setPecEnabled={setPecEnabled}
         />
 
         <div className="center-viewer">

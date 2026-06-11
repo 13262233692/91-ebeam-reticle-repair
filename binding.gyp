@@ -4,9 +4,11 @@
       "target_name": "ebeam-repair",
       "sources": [
         "src/addon.cpp",
+        "src/common.cpp",
         "src/image_processor.cpp",
         "src/scan_path_generator.cpp",
-        "src/dose_matrix_builder.cpp"
+        "src/dose_matrix_builder.cpp",
+        "src/pec_corrector.cpp"
       ],
       "include_dirs": [
         "<!@(node -p \"require('node-addon-api').include\")",
